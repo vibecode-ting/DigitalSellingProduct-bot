@@ -23,6 +23,7 @@ import {
   getAllCustomerChatIds,
   updateOrderByOrderId,
   warmCache,
+  invalidate,
   getWalletBalance,
   reserveWalletTxId,
   creditWallet,
@@ -121,6 +122,16 @@ async function resolveAdminChatId(settings) {
     return adminChatId;
   }
   return null;
+}
+
+// ─── Shop name from Settings ────────────────────────────────────────────────
+// Falls back to "Digital Shop" when the Settings tab has no "Shop Name" key.
+let cachedShopName = null;
+async function getShopName() {
+  if (cachedShopName) return cachedShopName;
+  const s = await getSettings();
+  cachedShopName = s["Shop Name"] || "Digital Shop";
+  return cachedShopName;
 }
 
 // Folder holding FAQ answer images (referenced by filename in the FAQ tab).
@@ -285,6 +296,7 @@ function categoryHeading(cat) {
  *  each name group. A non-clickable header button ("noop") shows each category. */
 async function sendMainMenu(chatId) {
   const products = await getProducts();
+  const shopName = await getShopName();
   if (products.length === 0) {
     return bot.sendMessage(chatId, "လောလောဆယ် ကုန်ပစ္စည်း မရှိသေးပါ။ နောက်မှ ပြန်ကြည့်ပေးပါနော် 🙏");
   }
@@ -322,7 +334,7 @@ async function sendMainMenu(chatId) {
 
   await bot.sendMessage(
     chatId,
-    "🛒 <b>Going Forward Digital Shop</b>\n\nကုန်ပစ္စည်း ရွေးချယ်ပါ 👇",
+    `🛒 <b>${esc(shopName)}</b>\n\nကုန်ပစ္စည်း ရွေးချယ်ပါ 👇`,
     { parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard } }
   );
 }
@@ -1672,8 +1684,9 @@ async function handleStart(msg, payload) {
     if (isAdmin) {
       await bot.sendMessage(chatId, "✅ Admin registered. You'll receive payslips here.");
     }
+    const shopName = await getShopName();
     // Show the persistent bottom menu once; Telegram keeps it visible after.
-    await bot.sendMessage(chatId, "👋 Going Forward Digital Shop မှ ကြိုဆိုပါတယ်!", {
+    await bot.sendMessage(chatId, `👋 ${esc(shopName)} မှ ကြိုဆိုပါတယ်!`, {
       reply_markup: mainKeyboard(),
     });
     // Deep link from the Mini App: /start p_<ProductID> → jump to that product.
@@ -1965,6 +1978,17 @@ async function handleTopupPhoto(msg) {
     bot.sendMessage(chatId, "⚠️ တစ်ခုခု မှားယွင်းသွားပါတယ်။ ထပ်မံကြိုးစားပေးပါ။");
   }
 }
+
+// ─── Admin /reload command ──────────────────────────────────────────────────
+bot.onText(/^\/reload$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const adminId = await resolveAdminChatId();
+  if (!adminId || String(chatId) !== String(adminId)) return;
+  cachedShopName = null;
+  invalidate();
+  await warmCache();
+  await bot.sendMessage(chatId, "✅ Cache cleared & reloaded from sheet.");
+});
 
 // Load the read-mostly tabs once at boot. Without this, whoever taps first
 // after a restart waits on three or four cold Sheets calls.
