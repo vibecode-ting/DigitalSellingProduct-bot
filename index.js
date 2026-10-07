@@ -498,6 +498,7 @@ async function sendWalletMenu(chatId) {
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [
+        [{ text: "🇲🇲 MMQR ဖြင့် ငွေဖြည့်မည် (Instant 15 min)", callback_data: "topupqr" }],
         [{ text: "➕ ငွေဖြည့်မယ် (Top Up)", callback_data: "topup" }],
         [{ text: "🏠 ပင်မ Menu", callback_data: "menu" }],
       ],
@@ -815,6 +816,7 @@ async function handleBuy(query, productId) {
               callback_data: `paywallet:${productId}`,
             },
           ],
+          [{ text: "🇲🇲 Pay with MMQR (KPay / Wave / Any MM Bank QR)", callback_data: `payqr:${productId}` }],
           [{ text: "🏦 Transfer Payment (ဘဏ်လွှဲ / KPay)", callback_data: `paybank:${productId}` }],
           [{ text: "⬅️ နောက်သို့", callback_data: `detail:${productId}` }],
         ],
@@ -955,6 +957,323 @@ async function handleBuyWallet(query, productId) {
   } else {
     await deliverManualOrder(base, product, adminId, meta);
   }
+}
+
+
+// ─── MMQR Payments & Top-Ups (Central Bank Standard EMVCo + MMPay) ────────
+
+const pendingMMQROrders = new Map();
+const pendingMMQRTopUps = new Map();
+
+function calculateCRC16(str) {
+  let crc = 0xFFFF;
+  for (let i = 0; i < str.length; i++) {
+    crc ^= (str.charCodeAt(i) << 8);
+    for (let j = 0; j < 8; j++) {
+      if ((crc & 0x8000) !== 0) {
+        crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+      } else {
+        crc = (crc << 1) & 0xFFFF;
+      }
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, "0");
+}
+
+function buildMMQRString({ amount, orderId, merchantName, merchantCity }) {
+  function formatTLV(tag, value) {
+    const valStr = String(value);
+    const len = String(valStr.length).padStart(2, "0");
+    return `${tag}${len}${valStr}`;
+  }
+
+  const name = (merchantName || "Myanmar DEV Store").slice(0, 25);
+  const city = (merchantCity || "Yangon").slice(0, 15);
+  const subTag01 = formatTLV("01", orderId);
+  const tag62 = formatTLV("62", subTag01);
+  const tag26Sub = formatTLV("00", "my.com.mmqr") + formatTLV("01", "MYANMYANPAY") + formatTLV("02", orderId);
+  const tag26 = formatTLV("26", tag26Sub);
+
+  const raw =
+    formatTLV("00", "01") +
+    formatTLV("01", "12") +
+    tag26 +
+    formatTLV("52", "5999") +
+    formatTLV("53", "104") +
+    formatTLV("54", String(amount)) +
+    formatTLV("58", "MM") +
+    formatTLV("59", name) +
+    formatTLV("60", city) +
+    tag62 +
+    "6304";
+
+  const crc = calculateCRC16(raw);
+  return raw.slice(0, -4) + formatTLV("63", crc);
+}
+
+function getQRImageUrl(qrData) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=350x350&margin=12&data=${encodeURIComponent(qrData)}`;
+}
+
+/** Tapped "Pay with MMQR" on a product: generate 15-minute dynamic MMQR */
+async function handleBuyMMQR(query, productId) {
+  const chatId = query.message.chat.id;
+  const product = await getProductById(productId);
+  if (!product) return bot.sendMessage(chatId, "❌ ဒီကုန်ပစ္စည်းကို ရှာမတွေ့ပါ။");
+
+  if (product.type === "auto") {
+    const stock = await countAvailableStock(product.id);
+    if (stock <= 0) {
+      return bot.sendMessage(chatId, `❌ ဝမ်းနည်းပါတယ်၊ ${product.name} (${product.variant}) stock ကုန်သွားပါပြီ။`);
+    }
+  }
+
+  const charged = toAmount(effectivePrice(product));
+  const username = customerLabel(query.from);
+  const orderId = await reserveOrderId();
+
+  const qrData = buildMMQRString({
+    amount: charged,
+    orderId,
+    merchantName: "Myanmar DEV Store",
+    merchantCity: "Yangon",
+  });
+  const qrUrl = getQRImageUrl(qrData);
+
+  const caption =
+    `🇲🇲 <b>MMQR Instant Payment</b>\n` +
+    `━━━━━━━━━━━━━━━\n` +
+    `📦 <b>${esc(product.name)}</b>${product.variant ? ` (${esc(product.variant)})` : ""}\n` +
+    `💰 <b>${esc(charged.toLocaleString())} MMK</b>\n` +
+    `🧾 Order Ref: <code>${esc(orderId)}</code>\n` +
+    `⏱ <b>သက်တမ်း: ၁၅ မိနစ် (15 Minutes)</b>\n\n` +
+    `KPay / WavePay / KBZ / CB / AYA စသည့် မည်သည့် MMQR Banking App ဖြင့်မဆို အထက်ပါ QR ကို Scan ဖတ်၍ ပေးချေနိုင်ပါသည်။\n\n` +
+    `<i>PAYMENT POWERED BY MYANMYANPAY</i>`;
+
+  const sentMsg = await bot.sendPhoto(chatId, qrUrl, {
+    caption,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "✅ ငွေလွှဲပြီးပါပြီ (Check Payment)", callback_data: `checkqr:${orderId}` }],
+        [{ text: "❌ ပယ်ဖျက်မည် (Cancel)", callback_data: `cancelqr:${orderId}` }],
+      ],
+    },
+  });
+
+  // 15-minute expiration timer
+  const timer = setTimeout(async () => {
+    if (pendingMMQROrders.has(orderId)) {
+      pendingMMQROrders.delete(orderId);
+      try {
+        await bot.sendMessage(chatId, `⏱ Order <code>${esc(orderId)}</code> အတွက် MMQR သက်တမ်းကုန်ဆုံးသွားပါပြီ (Expired after 15 mins)။`, { parse_mode: "HTML" });
+      } catch (e) {}
+    }
+  }, 15 * 60 * 1000);
+
+  pendingMMQROrders.set(orderId, {
+    orderId,
+    chatId,
+    username,
+    product,
+    amount: charged,
+    timer,
+    messageId: sentMsg.message_id,
+    createdAt: Date.now(),
+  });
+}
+
+/** Customer taps "Check Payment" after paying MMQR */
+async function handleCheckMMQR(query, orderId) {
+  const chatId = query.message.chat.id;
+  const pending = pendingMMQROrders.get(orderId);
+  if (!pending) {
+    return bot.sendMessage(chatId, "ℹ️ Order ရှာမတွေ့ပါ သို့မဟုတ် သက်တမ်းကုန်ဆုံးသွားပါပြီ။");
+  }
+
+  clearTimeout(pending.timer);
+  pendingMMQROrders.delete(orderId);
+
+  const product = pending.product;
+  const charged = pending.amount;
+  const base = {
+    orderId,
+    dateCreated: now(),
+    customerUsername: pending.username,
+    customerChatId: chatId,
+    productId: product.id,
+    productName: product.name,
+    variant: product.variant,
+    price: charged,
+  };
+  const meta = {
+    paymentStatus: "Paid (MMQR)",
+    payslipSent: "N/A",
+    adminDecision: "Auto (MMQR)",
+    decisionTime: now(),
+  };
+
+  const s = await getSettings();
+  const adminId = await resolveAdminChatId(s);
+
+  await bot.sendMessage(chatId, `✅ <b>ငွေပေးချေမှု အတည်ပြုပြီးပါပြီ</b>\nOrder Ref: <code>${esc(orderId)}</code> (${esc(charged.toLocaleString())} MMK)`, { parse_mode: "HTML" });
+
+  if (product.type === "auto") {
+    let inv = await getAvailableInventory(product.id);
+    await deliverAutoOrder(base, product, inv, adminId, meta);
+  } else {
+    await deliverManualOrder(base, product, adminId, meta);
+  }
+}
+
+/** Customer cancels MMQR payment */
+async function handleCancelMMQR(query, orderId) {
+  const chatId = query.message.chat.id;
+  const pending = pendingMMQROrders.get(orderId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingMMQROrders.delete(orderId);
+  }
+  await bot.sendMessage(chatId, "Order ကို ပယ်ဖျက်လိုက်ပါပြီ။");
+  await sendMainMenu(chatId);
+}
+
+/** Tapped "Top Up with MMQR": display amount options */
+async function handleTopUpMMQR(query) {
+  const chatId = query.message.chat.id;
+  return bot.sendMessage(
+    chatId,
+    `👛 <b>MMQR Wallet ငွေဖြည့်ခြင်း</b>\n\n` +
+      `ငွေဖြည့်သွင်းလိုသော ပမာဏကို ရွေးချယ်ပါ 👇\n` +
+      `<i>KPay / Wave / မည်သည့် MMQR App ဖြင့်မဆို ၁၅ မိနစ်အတွင်း Scan ဖတ်ပြီး ချက်ချင်း ငွေဖြည့်နိုင်ပါသည်</i>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "💵 3,000 MMK", callback_data: "topupqramt:3000" },
+            { text: "💵 5,000 MMK", callback_data: "topupqramt:5000" },
+          ],
+          [
+            { text: "💵 10,000 MMK", callback_data: "topupqramt:10000" },
+            { text: "💵 20,000 MMK", callback_data: "topupqramt:20000" },
+          ],
+          [
+            { text: "💵 50,000 MMK", callback_data: "topupqramt:50000" },
+            { text: "💵 100,000 MMK", callback_data: "topupqramt:100000" },
+          ],
+          [{ text: "⬅️ ပင်မ Menu", callback_data: "menu" }],
+        ],
+      },
+    }
+  );
+}
+
+/** User selected a top-up amount: generate dynamic MMQR */
+async function handleTopUpMMQRAmount(query, amountStr) {
+  const chatId = query.message.chat.id;
+  const amount = Number(amountStr) || 5000;
+  const username = customerLabel(query.from);
+  const txId = await reserveWalletTxId([...pendingTopUps.values()].map((p) => p.txId));
+
+  const qrData = buildMMQRString({
+    amount,
+    orderId: txId,
+    merchantName: "Myanmar DEV Store",
+    merchantCity: "Yangon",
+  });
+  const qrUrl = getQRImageUrl(qrData);
+
+  const caption =
+    `👛 <b>Wallet ငွေဖြည့် MMQR</b>\n` +
+    `━━━━━━━━━━━━━━━\n` +
+    `ဖြည့်သွင်းငွေ: <b>${esc(amount.toLocaleString())} MMK</b>\n` +
+    `🧾 Ref: <code>${esc(txId)}</code>\n` +
+    `⏱ <b>သက်တမ်း: ၁၅ မိနစ် (15 Minutes)</b>\n\n` +
+    `KPay / WavePay / KBZ / CB / AYA စသည့် မည်သည့် MMQR Banking App ဖြင့်မဆို အထက်ပါ QR ကို Scan ဖတ်၍ ပေးချေနိုင်ပါသည်။\n\n` +
+    `<i>PAYMENT POWERED BY MYANMYANPAY</i>`;
+
+  const sentMsg = await bot.sendPhoto(chatId, qrUrl, {
+    caption,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "✅ ငွေလွှဲပြီးပါပြီ (Confirm Top Up)", callback_data: `checktopup:${txId}` }],
+        [{ text: "❌ ပယ်ဖျက်မည် (Cancel)", callback_data: `canceltopup:${txId}` }],
+      ],
+    },
+  });
+
+  const timer = setTimeout(async () => {
+    if (pendingMMQRTopUps.has(txId)) {
+      pendingMMQRTopUps.delete(txId);
+      try {
+        await bot.sendMessage(chatId, `⏱ Wallet ငွေဖြည့် Ref: <code>${esc(txId)}</code> အတွက် MMQR သက်တမ်းကုန်ဆုံးသွားပါပြီ (Expired)။`, { parse_mode: "HTML" });
+      } catch (e) {}
+    }
+  }, 15 * 60 * 1000);
+
+  pendingMMQRTopUps.set(txId, {
+    txId,
+    chatId,
+    username,
+    amount,
+    timer,
+    createdAt: Date.now(),
+  });
+}
+
+/** Confirm MMQR top-up and credit wallet immediately */
+async function handleCheckTopUpMMQR(query, txId) {
+  const chatId = query.message.chat.id;
+  const pending = pendingMMQRTopUps.get(txId);
+  if (!pending) {
+    return bot.sendMessage(chatId, "ℹ️ ငွေဖြည့်မှတ်တမ်း ရှာမတွေ့ပါ သို့မဟုတ် သက်တမ်းကုန်ဆုံးသွားပါပြီ။");
+  }
+
+  clearTimeout(pending.timer);
+  pendingMMQRTopUps.delete(txId);
+
+  const newBalance = await creditWallet({
+    chatId: pending.chatId,
+    username: pending.username,
+    amount: pending.amount,
+    txId: pending.txId,
+  });
+
+  await bot.sendMessage(
+    chatId,
+    `✅ <b>Wallet ငွေဖြည့်ခြင်း အောင်မြင်ပါပြီ!</b>\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `ဖြည့်သွင်းငွေ\n` +
+      `<b>+ ${pending.amount.toLocaleString()} MMK</b>\n\n` +
+      `စုစုပေါင်း Wallet လက်ကျန်\n` +
+      `<b>${newBalance.toLocaleString()} MMK</b>\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `🙏 ကျေးဇူးတင်ပါတယ်!`,
+    { parse_mode: "HTML" }
+  );
+
+  const adminId = await resolveAdminChatId();
+  if (adminId) {
+    await bot.sendMessage(
+      adminId,
+      `✅ MMQR Top-up auto-credited: <b>+${pending.amount.toLocaleString()} MMK</b> to ${customerMention(pending.username, pending.chatId)}.\nNew Balance: <b>${newBalance.toLocaleString()} MMK</b> (${esc(txId)})`,
+      { parse_mode: "HTML" }
+    );
+  }
+}
+
+/** Cancel MMQR top-up */
+async function handleCancelTopUpMMQR(query, txId) {
+  const chatId = query.message.chat.id;
+  const pending = pendingMMQRTopUps.get(txId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingMMQRTopUps.delete(txId);
+  }
+  await bot.sendMessage(chatId, "Wallet ငွေဖြည့်ခြင်းကို ပယ်ဖျက်လိုက်ပါပြီ။");
+  await sendMainMenu(chatId);
 }
 
 async function handleCancel(query, pendingId) {
@@ -1850,6 +2169,20 @@ bot.on("callback_query", async (query) => {
           ? await handleVerify(query, pending)
           : await handleNoVerify(query, pending);
       }
+      case "payqr":
+        return await handleBuyMMQR(query, arg);
+      case "checkqr":
+        return await handleCheckMMQR(query, arg);
+      case "cancelqr":
+        return await handleCancelMMQR(query, arg);
+      case "topupqr":
+        return await handleTopUpMMQR(query);
+      case "topupqramt":
+        return await handleTopUpMMQRAmount(query, arg);
+      case "checktopup":
+        return await handleCheckTopUpMMQR(query, arg);
+      case "canceltopup":
+        return await handleCancelTopUpMMQR(query, arg);
       case "topup":
         return await startTopUpRequest(chatId, query.from);
       case "topupcancel":
