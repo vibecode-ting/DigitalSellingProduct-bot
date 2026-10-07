@@ -338,20 +338,39 @@ async function startPayment() {
     // Generate a unique order ID
     const orderId = `ORD-${Date.now()}`;
     const product  = selectedProduct;
-    const amount   = Number(product.Promo === 'Yes' && product['Promo Price'] ? product['Promo Price'] : product['Price (MMK)']);
+    const rawPrice = product.Promo === 'Yes' && product['Promo Price'] ? product['Promo Price'] : product['Price (MMK)'];
+    const amount   = Number(String(rawPrice || '0').replace(/[,\s]/g, ''));
 
-    // Show MMPay's built-in QR modal
-    // The SDK handles QR display, countdown, and polling automatically
-    await MMPayApp.showPaymentModal({ orderId, amount }, async (result) => {
-        if (result.success) {
-            // Payment confirmed — deliver the product
-            await deliverProduct(product, orderId, result.transactionId);
-        } else if (result.cancelled) {
-            // User closed the modal — do nothing, they can try again
-        } else if (result.expired) {
-            showError('QR code expired. Please try again.');
-        }
-    });
+    const paymentPayload = {
+        orderId: String(orderId),
+        amount: amount,
+        currency: 'MMK',
+        customMessage: `${product['Product Name']} - ${product.Variant || ''}`.trim().slice(0, 100),
+        items: [
+            {
+                name: `${product['Product Name']} (${product.Variant || ''})`.trim().slice(0, 100),
+                amount: amount,
+                quantity: 1
+            }
+        ]
+    };
+
+    try {
+        // Show MMPay's built-in QR modal
+        await MMPayApp.showPaymentModal(paymentPayload, async (result) => {
+            if (result.success) {
+                // Payment confirmed — deliver the product
+                await deliverProduct(product, orderId, result.transactionId);
+            } else if (result.cancelled) {
+                // User closed the modal — do nothing
+            } else if (result.expired) {
+                showError('QR code expired. Please try again.');
+            }
+        });
+    } catch (err) {
+        console.error('MMPay error:', err);
+        showError(`Payment creation failed: ${err.message || 'Please try again'}`);
+    }
 }
 
 // ─── Product Delivery ─────────────────────────────────────────────────────────
