@@ -142,11 +142,6 @@ let inventoryData   = []; // loaded from CSV
 // Set shop name from config
 document.getElementById('shop-title').innerText = SHOP_NAME;
 
-// Hide email option if EmailJS not configured
-if (!EMAILJS_SERVICE_ID || !EMAILJS_TEMPLATE_ID || !EMAILJS_PUBLIC_KEY) {
-    document.getElementById('btn-email').style.display = 'none';
-}
-
 // Init EmailJS
 if (EMAILJS_PUBLIC_KEY) {
     emailjs.init({ publicKey: EMAILJS_PUBLIC_KEY });
@@ -179,10 +174,17 @@ async function loadProducts() {
     }
 
     try {
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(SHEET_CSV_URL)}`;
-        const res  = await fetch(proxyUrl);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const csv  = await res.text();
+        let csv;
+        try {
+            const res = await fetch(SHEET_CSV_URL);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            csv = await res.text();
+        } catch (fetchErr) {
+            const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(SHEET_CSV_URL)}`;
+            const res  = await fetch(proxyUrl);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            csv  = await res.text();
+        }
         const rows = parseCSV(csv);
         if (rows.length < 2) throw new Error('No rows in sheet');
 
