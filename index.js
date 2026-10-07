@@ -2049,3 +2049,230 @@ ensureOrderExpiryColumn()
   .catch((e) => console.error("⚠️ Expiry column unavailable:", e.message));
 
 console.log("🤖 Bot is running...");
+
+// ─── Express Server for Shop & Webhooks ──────────────────────────────────────
+import express from 'express';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import nodemailer from 'nodemailer';
+import crypto from 'crypto';
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// Serve the static shop frontend
+app.use('/shop', express.static(path.join(__dirname, 'shop')));
+
+// 1. Get products for the storefront
+app.get('/api/products', async (req, res) => {
+  try {
+    const products = await getProducts();
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Generate MMPay QR
+app.post('/api/checkout', async (req, res) => {
+  try {
+    const { productId, deliveryMethod, contact, chatId } = req.body;
+    
+    // Find product
+    const product = await getProductById(productId);
+    if (!product) return res.status(404).json({ error: "Product not found" });
+
+    // Check stock if auto
+    if (product.type === "auto") {
+      const stock = await countAvailableStock(product.id);
+      if (stock <= 0) return res.status(400).json({ error: "Out of stock" });
+    }
+
+    const amount = toAmount(effectivePrice(product));
+    
+    // Create an order ID
+    const orderId = await reserveOrderId();
+    
+    // Save pending order in memory so webhook can find it
+    pendingOrders.set(orderId, {
+      orderId,
+      product,
+      charged: amount,
+      chatId: chatId || "WebUser",
+      username: contact,
+      deliveryMethod, // 'telegram' or 'email'
+      dateCreated: now()
+    });
+
+    // Call MyanMyanPay API to generate QR
+    const mmpayPayload = {
+      orderId,
+      amount,
+      currency: "MMK",
+      callbackUrl: process.env.WEBHOOK_URL || "https://api.sandbox.testapp.com/webhook",
+      items: [{ name: product.name, amount, quantity: 1 }]
+    };
+
+    // If using real MMPay API, it would be:
+    // const qrRes = await fetch("https://api.myanmyanpay.com/v1/qr/generate", { ... })
+    // Since we don't have a real API endpoint, we will mock the QR generation 
+    // for this sandbox integration if the real fetch fails.
+    
+    let qrData = "Mock_QR_Data";
+    try {
+      const response = await fetch("https://api.myanmyanpay.com/v1/qr/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.MMPAY_SECRET_KEY}`,
+          "Merchant-Id": process.env.MMPAY_MERCHANT_ID
+        },
+        body: JSON.stringify(mmpayPayload)
+      });
+      const data = await response.json();
+      if (data.qr) qrData = data.qr;
+    } catch (e) {
+      console.log("MMPay API call failed, using mock QR for sandbox");
+      // Use a generic placeholder QR image for the frontend
+      qrData = "https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=MockPayment123";
+    }
+
+    // Usually MMPay returns an EMVCo string, but if they return an image URL we use it directly.
+    // If it's a raw EMVCo string, the frontend would need a QR library to render it. 
+    // We will just pass the placeholder image URL for now.
+    res.json({
+      orderId,
+      amount,
+      qrCodeBase64: qrData.startsWith("http") ? qrData : `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(qrData)}`
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Webhook Receiver for MMPay
+app.post('/api/webhook', async (req, res) => {
+  console.log("🔔 Received Webhook from MMPay:", req.body);
+  const { orderId, status } = req.body;
+
+  if (status === 'SUCCESS' || status === 'PAID') {
+    const order = pendingOrders.get(orderId);
+    if (!order) return res.status(404).send("Order not found");
+
+    // Mark as PAID
+    order.paymentStatus = "Paid";
+    
+    // Deliver the product!
+    let credentials = "Contact Admin";
+    if (order.product.type === "auto") {
+      const inv = await getAvailableInventory(order.product.id);
+      if (inv) {
+        credentials = inv.credentials;
+        await markInventorySold(inv.rowNumber, order.username, orderId);
+      }
+    }
+
+    // Save to Google Sheet Orders tab
+    await createOrder([
+      orderId,
+      order.dateCreated,
+      order.username,
+      order.chatId,
+      order.product.id,
+      order.product.name,
+      order.product.variant || "",
+      order.charged,
+      "Paid (MM QR)",    // Payment Status
+      "Yes",             // Payslip Sent (N/A for QR, but we mark Yes)
+      "Auto-Approved",   // Admin Decision
+      now(),             // Decision Time
+      "Delivered",       // Delivery Status
+      credentials !== "Contact Admin" ? "Auto" : "", 
+      credentials,       // Credentials Sent
+      now(),             // Used DateTime
+      expiryFor(order.product.duration) || "",
+    ]);
+
+    // Send the product to the user based on delivery method
+    if (order.deliveryMethod === 'email') {
+      await sendEmailDelivery(order.username, order.product, credentials);
+    } else if (order.deliveryMethod === 'telegram' && order.chatId !== "WebUser") {
+      await bot.sendMessage(
+        order.chatId,
+        `✅ <b>Payment Received!</b>\n\n📦 <b>${esc(order.product.name)}</b>\n\n🔑 <b>Account Details:</b>\n<code>${esc(credentials)}</code>\n\nThank you for your purchase!`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    // Push to order desk if enabled
+    await pushOrderToDesk(orderId, order.dateCreated, order.username, order.product, order.charged);
+    
+    // Remove from pending
+    pendingOrders.delete(orderId);
+    
+    // Also save in a fulfilled map so frontend polling knows it's done
+    fulfilledOrders.add(orderId);
+  }
+  
+  res.send("OK");
+});
+
+const fulfilledOrders = new Set();
+
+// 4. Polling endpoint for frontend
+app.get('/api/order-status', (req, res) => {
+  const { orderId } = req.query;
+  if (fulfilledOrders.has(orderId)) {
+    res.json({ status: 'PAID' });
+  } else if (pendingOrders.has(orderId)) {
+    res.json({ status: 'PENDING' });
+  } else {
+    res.status(404).json({ error: "Not found" });
+  }
+});
+
+// Helper: Send Email Delivery
+async function sendEmailDelivery(toEmail, product, credentials) {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    console.error("Missing SMTP credentials for email delivery");
+    return;
+  }
+  
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+
+  const mailOptions = {
+    from: `"Digital Shop" <${process.env.SMTP_USER}>`,
+    to: toEmail,
+    subject: `Your Order: ${product.name}`,
+    html: `
+      <h2>Thank you for your purchase!</h2>
+      <p>Here are your account details for <b>${product.name} ${product.variant || ''}</b>:</p>
+      <div style="background:#f4f4f4; padding:15px; border-radius:5px; font-family:monospace; font-size:16px;">
+        ${credentials.replace(/\n/g, '<br>')}
+      </div>
+      <p>If you have any issues, please contact our support on Telegram.</p>
+    `
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`Delivered ${product.id} to ${toEmail} via Email`);
+  } catch (err) {
+    console.error("Email delivery failed:", err);
+  }
+}
+
+// Start the Express server alongside the Telegram Bot
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Shop Storefront & Webhook Server running on port ${PORT}`);
+});

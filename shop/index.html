@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Digital Shop</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="config.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .loader { border: 3px solid #e5e7eb; border-top: 3px solid #3b82f6; border-radius: 50%; width: 28px; height: 28px; animation: spin 0.8s linear infinite; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+        .modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:50; align-items:center; justify-content:center; }
+        .modal.active { display:flex; }
+        .step { display:none; }
+        .step.active { display:block; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<!-- Header -->
+<header class="bg-white border-b sticky top-0 z-40 shadow-sm">
+    <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+        <h1 class="text-xl font-bold text-gray-900">🛍 Digital Shop</h1>
+        <span class="text-xs text-gray-400">Instant Delivery</span>
+    </div>
+</header>
+
+<!-- Product Grid -->
+<main class="max-w-5xl mx-auto px-4 py-6">
+    <div id="loading" class="flex flex-col items-center py-20 gap-3">
+        <div class="loader"></div>
+        <p class="text-gray-400 text-sm">Loading products...</p>
+    </div>
+    <div id="error-box" class="hidden bg-red-50 text-red-700 rounded-xl p-6 text-center">
+        <p class="font-bold mb-1">⚠️ Could not load products</p>
+        <p class="text-sm" id="error-msg"></p>
+        <p class="text-xs mt-3 text-red-400">Make sure SHEET_CSV_URL is set in config.js and the sheet is published to web.</p>
+    </div>
+    <div id="product-grid" class="hidden grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5"></div>
+</main>
+
+<!-- Checkout Modal -->
+<div id="modal" class="modal">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6 relative max-h-[90vh] overflow-y-auto">
+        <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-300 hover:text-gray-600">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+
+        <!-- Step 1: Choose delivery -->
+        <div id="step-method" class="step active">
+            <p class="text-xs text-gray-400 mb-1 uppercase tracking-wide">Step 1 of 3</p>
+            <h2 class="text-xl font-bold mb-1" id="modal-product-name">Product</h2>
+            <p class="text-blue-600 font-bold mb-5" id="modal-product-price"></p>
+            <p class="text-sm font-medium text-gray-700 mb-3">How do you want your product delivered?</p>
+            <button onclick="chooseMethod('telegram')" class="w-full flex items-center gap-3 px-4 py-3 border-2 border-blue-500 rounded-xl mb-3 hover:bg-blue-50 transition text-left">
+                <span class="text-2xl">✈️</span>
+                <div>
+                    <p class="font-bold text-blue-700 text-sm">Telegram</p>
+                    <p class="text-xs text-gray-500">Sent directly to your Telegram chat</p>
+                </div>
+            </button>
+            <button onclick="chooseMethod('email')" class="w-full flex items-center gap-3 px-4 py-3 border-2 border-gray-200 rounded-xl hover:bg-gray-50 transition text-left">
+                <span class="text-2xl">📧</span>
+                <div>
+                    <p class="font-bold text-gray-700 text-sm">Email</p>
+                    <p class="text-xs text-gray-500">Sent to your email address</p>
+                </div>
+            </button>
+        </div>
+
+        <!-- Step 2: Enter contact -->
+        <div id="step-contact" class="step">
+            <p class="text-xs text-gray-400 mb-1 uppercase tracking-wide">Step 2 of 3</p>
+            <h2 class="text-xl font-bold mb-5" id="step2-title">Your Contact</h2>
+
+            <!-- Telegram detected (inside Mini App) -->
+            <div id="tg-detected" class="hidden bg-blue-50 border border-blue-200 rounded-xl p-4 mb-4 text-center">
+                <p class="text-xs text-gray-500 mb-1">We detected your Telegram account:</p>
+                <p class="font-bold text-blue-700 text-lg" id="tg-username-display"></p>
+                <p class="text-xs text-gray-400 mt-1">Your product will be sent here.</p>
+            </div>
+
+            <!-- Manual input (email or Telegram username on web browser) -->
+            <div id="manual-input" class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1" id="input-label">Email Address</label>
+                <input id="contact-input" type="text" placeholder="you@example.com"
+                    class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+            </div>
+
+            <button onclick="goToPayment()" id="pay-btn"
+                class="w-full bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700 transition text-sm">
+                Continue to Payment →
+            </button>
+            <button onclick="showStep('step-method')" class="w-full mt-2 text-xs text-gray-400 hover:text-gray-600 text-center">← Back</button>
+        </div>
+
+        <!-- Step 3: QR Code -->
+        <div id="step-qr" class="step text-center">
+            <p class="text-xs text-gray-400 mb-1 uppercase tracking-wide">Step 3 of 3</p>
+            <h2 class="text-xl font-bold mb-1">Scan to Pay</h2>
+            <p class="text-xs text-gray-500 mb-4">Use KPay, Wave, CB Pay, or any Myanmar QR app</p>
+
+            <div class="bg-gray-50 rounded-xl p-3 inline-block mb-3 border">
+                <img id="qr-img" src="" alt="QR Code" class="w-52 h-52 mx-auto rounded-lg">
+            </div>
+            <p class="font-bold text-lg text-gray-800 mb-1">Total: <span id="qr-amount" class="text-blue-600"></span> MMK</p>
+            <p class="text-xs text-red-400 mb-4">⏱ Expires in 15 minutes</p>
+
+            <div class="flex items-center justify-center gap-2 text-sm text-gray-500">
+                <div class="loader" style="width:16px;height:16px;border-width:2px;"></div>
+                Waiting for payment confirmation...
+            </div>
+        </div>
+
+        <!-- Step 4: Success -->
+        <div id="step-success" class="step text-center py-4">
+            <div class="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                <svg class="w-9 h-9 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/></svg>
+            </div>
+            <h2 class="text-2xl font-bold text-gray-900 mb-2">Payment Successful!</h2>
+            <p class="text-gray-500 text-sm mb-1">Your product has been sent to your</p>
+            <p class="font-bold text-blue-600 mb-6" id="success-contact-label"></p>
+            <button onclick="closeModal()" class="bg-gray-100 text-gray-700 font-bold px-8 py-2.5 rounded-xl hover:bg-gray-200 transition text-sm">Done</button>
+        </div>
+
+        <!-- Fallback: no backend configured -->
+        <div id="step-no-backend" class="step text-center py-4">
+            <p class="text-4xl mb-3">🤖</p>
+            <h2 class="text-xl font-bold mb-2">Buy via Telegram Bot</h2>
+            <p class="text-sm text-gray-500 mb-5">Tap the button below to open the bot and complete your purchase with KPay / Wave QR.</p>
+            <a id="bot-deeplink" href="#" target="_blank"
+               class="inline-block bg-blue-600 text-white font-bold px-6 py-3 rounded-xl hover:bg-blue-700 transition text-sm">
+                Open Telegram Bot →
+            </a>
+            <button onclick="closeModal()" class="block w-full mt-3 text-xs text-gray-400 hover:text-gray-600 text-center">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+let selectedProduct = null;
+let deliveryMethod  = 'telegram';
+let currentOrderId  = null;
+let pollTimer       = null;
+const tg = window.Telegram?.WebApp;
+
+// ─── Load products from Google Sheets CSV ────────────────────────────────────
+async function loadProducts() {
+    const grid    = document.getElementById('product-grid');
+    const loading = document.getElementById('loading');
+    const errBox  = document.getElementById('error-box');
+
+    if (!SHEET_CSV_URL) {
+        loading.classList.add('hidden');
+        errBox.classList.remove('hidden');
+        document.getElementById('error-msg').innerText = 'SHEET_CSV_URL is not set in config.js.';
+        return;
+    }
+
+    try {
+        // Use allorigins proxy to avoid CORS on GitHub Pages
+        const url = `https://api.allorigins.win/raw?url=${encodeURIComponent(SHEET_CSV_URL)}`;
+        const res  = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const csv  = await res.text();
+        const rows = parseCSV(csv);
+        if (rows.length < 2) throw new Error('No product rows found in sheet.');
+
+        const headers = rows[0];
+        const products = rows.slice(1).map(r => {
+            const obj = {};
+            headers.forEach((h, i) => obj[h.trim()] = (r[i] || '').trim());
+            return obj;
+        }).filter(p => p.Active === 'Yes');
+
+        if (products.length === 0) {
+            loading.classList.add('hidden');
+            errBox.classList.remove('hidden');
+            document.getElementById('error-msg').innerText = 'No active products found. Add products to the sheet and mark them Active = Yes.';
+            return;
+        }
+
+        // Group by category
+        const groups = {};
+        const order  = [];
+        products.forEach(p => {
+            const cat = p.Category || 'Others';
+            if (!groups[cat]) { groups[cat] = []; order.push(cat); }
+            groups[cat].push(p);
+        });
+
+        grid.innerHTML = '';
+        order.forEach(cat => {
+            const heading = document.createElement('div');
+            heading.className = 'col-span-full flex items-center gap-3 mt-2';
+            heading.innerHTML = `<span class="text-xs font-bold uppercase tracking-widest text-gray-400">${cat}</span><div class="flex-1 border-t border-gray-200"></div>`;
+            grid.appendChild(heading);
+
+            groups[cat].forEach(p => {
+                const isPromo  = p.Promo === 'Yes' && p['Promo Price'];
+                const price    = isPromo ? p['Promo Price'] : p['Price (MMK)'];
+                const oldPrice = isPromo ? p['Price (MMK)'] : null;
+
+                const card = document.createElement('div');
+                card.className = 'bg-white rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition p-5 flex flex-col';
+                card.innerHTML = `
+                    <div class="text-4xl text-center mb-3">${p.Icon || '📦'}</div>
+                    <h3 class="font-bold text-gray-900 text-center leading-tight">${p['Product Name']}</h3>
+                    <p class="text-xs text-gray-400 text-center mt-0.5 mb-2">${p.Variant} · ${p.Duration || ''}</p>
+                    <p class="text-xs text-gray-500 text-center mb-4 line-clamp-2 flex-1">${p.Description || ''}</p>
+                    <div class="text-center mb-4">
+                        ${oldPrice ? `<span class="text-gray-300 line-through text-sm mr-1">${Number(oldPrice).toLocaleString()}</span>` : ''}
+                        <span class="font-bold text-blue-600">${Number(price).toLocaleString()} MMK</span>
+                        ${isPromo ? '<span class="ml-1 text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full">SALE</span>' : ''}
+                    </div>
+                    <button class="w-full bg-gray-900 text-white font-bold py-2.5 rounded-xl hover:bg-gray-700 transition text-sm">Buy Now</button>
+                `;
+                card.querySelector('button').onclick = () => openCheckout(p);
+                grid.appendChild(card);
+            });
+        });
+
+        loading.classList.add('hidden');
+        grid.classList.remove('hidden');
+
+    } catch (err) {
+        console.error(err);
+        loading.classList.add('hidden');
+        errBox.classList.remove('hidden');
+        document.getElementById('error-msg').innerText = err.message;
+    }
+}
+
+// ─── Simple CSV parser (handles quoted fields) ────────────────────────────────
+function parseCSV(text) {
+    const rows = [];
+    let row = [], cell = '', inQ = false;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') { inQ = !inQ; }
+        else if (c === ',' && !inQ) { row.push(cell); cell = ''; }
+        else if ((c === '\n' || c === '\r') && !inQ) {
+            if (cell || row.length) { row.push(cell); rows.push(row); }
+            row = []; cell = '';
+            if (c === '\r' && text[i+1] === '\n') i++;
+        } else { cell += c; }
+    }
+    if (cell || row.length) { row.push(cell); rows.push(row); }
+    return rows;
+}
+
+// ─── Checkout flow ────────────────────────────────────────────────────────────
+function openCheckout(product) {
+    selectedProduct = product;
+    const price = product.Promo === 'Yes' && product['Promo Price'] ? product['Promo Price'] : product['Price (MMK)'];
+    document.getElementById('modal-product-name').innerText = `${product.Icon || ''} ${product['Product Name']} — ${product.Variant}`;
+    document.getElementById('modal-product-price').innerText = `${Number(price).toLocaleString()} MMK`;
+    showStep('step-method');
+    document.getElementById('modal').classList.add('active');
+    if (tg) tg.expand();
+}
+
+function closeModal() {
+    document.getElementById('modal').classList.remove('active');
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+}
+
+function chooseMethod(method) {
+    deliveryMethod = method;
+
+    const tgDetected  = document.getElementById('tg-detected');
+    const manualInput = document.getElementById('manual-input');
+    const inputLabel  = document.getElementById('input-label');
+    const contactInput = document.getElementById('contact-input');
+    const step2Title  = document.getElementById('step2-title');
+
+    if (method === 'telegram') {
+        step2Title.innerText = 'Your Telegram';
+        if (tg && tg.initDataUnsafe?.user) {
+            const user = tg.initDataUnsafe.user;
+            document.getElementById('tg-username-display').innerText = 
+                user.username ? `@${user.username}` : user.first_name;
+            tgDetected.classList.remove('hidden');
+            manualInput.classList.add('hidden');
+        } else {
+            tgDetected.classList.add('hidden');
+            manualInput.classList.remove('hidden');
+            inputLabel.innerText = 'Telegram Username';
+            contactInput.placeholder = '@username';
+            contactInput.value = '';
+        }
+    } else {
+        step2Title.innerText = 'Your Email';
+        tgDetected.classList.add('hidden');
+        manualInput.classList.remove('hidden');
+        inputLabel.innerText = 'Email Address';
+        contactInput.placeholder = 'you@example.com';
+        contactInput.value = '';
+    }
+    showStep('step-contact');
+}
+
+async function goToPayment() {
+    let contact = '';
+    let chatId  = '';
+
+    if (deliveryMethod === 'telegram' && tg && tg.initDataUnsafe?.user) {
+        const user = tg.initDataUnsafe.user;
+        contact = user.username ? `@${user.username}` : user.first_name;
+        chatId  = String(user.id);
+    } else {
+        contact = document.getElementById('contact-input').value.trim();
+        if (!contact) { alert('Please enter your contact detail.'); return; }
+    }
+
+    // If no backend configured, show bot deeplink fallback
+    if (!BACKEND_API) {
+        const pid = selectedProduct['Product ID'];
+        document.getElementById('bot-deeplink').href = `https://t.me/${BOT_USERNAME}?start=p_${pid}`;
+        showStep('step-no-backend');
+        return;
+    }
+
+    const btn = document.getElementById('pay-btn');
+    btn.innerText = 'Generating QR…'; btn.disabled = true;
+
+    try {
+        const res = await fetch(`${BACKEND_API}/api/checkout`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                productId: selectedProduct['Product ID'],
+                deliveryMethod, contact, chatId
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed');
+
+        currentOrderId = data.orderId;
+        const price = selectedProduct.Promo === 'Yes' && selectedProduct['Promo Price']
+            ? selectedProduct['Promo Price'] : selectedProduct['Price (MMK)'];
+        document.getElementById('qr-img').src = data.qrCodeBase64;
+        document.getElementById('qr-amount').innerText = Number(price).toLocaleString();
+        showStep('step-qr');
+        pollTimer = setInterval(pollStatus, 3000);
+
+    } catch (err) {
+        alert('Error: ' + err.message);
+    } finally {
+        btn.innerText = 'Continue to Payment →'; btn.disabled = false;
+    }
+}
+
+async function pollStatus() {
+    if (!currentOrderId || !BACKEND_API) return;
+    try {
+        const res  = await fetch(`${BACKEND_API}/api/order-status?orderId=${currentOrderId}`);
+        const data = await res.json();
+        if (data.status === 'PAID') {
+            clearInterval(pollTimer); pollTimer = null;
+            const contact = (deliveryMethod === 'telegram' && tg?.initDataUnsafe?.user)
+                ? `@${tg.initDataUnsafe.user.username || tg.initDataUnsafe.user.first_name}`
+                : document.getElementById('contact-input').value;
+            document.getElementById('success-contact-label').innerText = contact;
+            showStep('step-success');
+        }
+    } catch (_) {}
+}
+
+function showStep(id) {
+    document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+}
+
+document.addEventListener('DOMContentLoaded', loadProducts);
+</script>
+
+</body>
+</html>
